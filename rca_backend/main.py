@@ -1,4 +1,4 @@
-﻿"""
+"""
 FastAPI Backend for AI-Powered Root Cause Analysis.
 
 Exposes two endpoints:
