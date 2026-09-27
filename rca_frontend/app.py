@@ -155,7 +155,10 @@ elif st.session_state.step == 3:
                 st.session_state.step = 4
                 st.rerun()
             else:
-                detail = response.json().get("detail", response.text)
+                try:
+                    detail = response.json().get("detail", response.text)
+                except Exception:
+                    detail = response.text or f"HTTP {response.status_code}"
                 st.error(f"Backend error {response.status_code}: {detail}")
                 if st.button("← Back"):
                     st.session_state.step = 2

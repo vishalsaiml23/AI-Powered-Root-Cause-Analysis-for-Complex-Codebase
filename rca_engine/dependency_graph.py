@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 
 from .ast_analyzer import SymbolNode
 

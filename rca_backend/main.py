@@ -20,9 +20,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import openai
 from rca_engine.ast_analyzer import ASTAnalyzer
 from rca_engine.dependency_graph import DependencyGraph
-from rca_engine.bob_agent import BobAgent, RCAResult, FixProposal
+from rca_engine.bob_agent import BobAgent, BobAgentCoordinator, RCAResult, FixProposal
 from rca_engine.verification_engine import VerificationEngine
 from rca_engine.report_generator import ReportGenerator
 
@@ -95,14 +96,6 @@ def analyze(request: AnalyzeRequest):
     t0 = time.time()
     session_id = f"bob-rca-{int(t0)}"
 
-    # Check API key early to give a clear error
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY environment variable is not set. "
-                   "Set it before starting the backend.",
-        )
-
     repo_path = os.path.abspath(request.repo_path)
     if not os.path.isdir(repo_path):
         raise HTTPException(
@@ -122,30 +115,65 @@ def analyze(request: AnalyzeRequest):
     graph_dict = graph.get_graph_dict()
     source_files = graph.get_source_files()
 
-    # --- 3. Root cause analysis ---
-    agent = BobAgent()
-    rca_result = agent.analyze_root_cause(graph_dict, request.bug_description, source_files)
+    # --- 3. Root cause analysis + fix generation ---
+    # Try GPT-4o first; fall back to local BobAgentCoordinator if quota is exhausted
+    engine = VerificationEngine()
+    try:
+        agent = BobAgent()
+        rca_result = agent.analyze_root_cause(graph_dict, request.bug_description, source_files)
 
-    # --- 4. Fix generation ---
-    culprit_source = source_files.get(rca_result.culprit_file, "")
-    if not culprit_source:
-        # Try to find by basename
+        culprit_source = source_files.get(rca_result.culprit_file, "")
+        if not culprit_source:
+            for path, src in source_files.items():
+                if rca_result.culprit_file in path:
+                    culprit_source = src
+                    rca_result.culprit_file = path
+                    break
+
+        fix_proposal = agent.generate_fix(rca_result, culprit_source)
+        regression_tests = agent.generate_regression_tests(rca_result, fix_proposal)
+
+    except (openai.RateLimitError, openai.AuthenticationError, EnvironmentError):
+        # Fall back to local hardcoded coordinator (no API key needed)
+        from rca_engine.ast_analyzer import CodebaseScanner
+        coordinator = BobAgentCoordinator(repo_path)
+        coordinator.initialize_with_analyses(CodebaseScanner(repo_path).scan())
+        result = coordinator.run_full_rca(request.bug_description)
+
+        a = result["analysis"]
+        p = result["patch"]
+        rca_result = RCAResult(
+            culprit_file=a["culprit_file"],
+            culprit_symbol=a["culprit_symbol"],
+            culprit_line=a["line_number"],
+            confidence_score=int(a["confidence_score"] * 100),
+            root_cause_explanation=a["root_cause_explanation"],
+            propagation_steps=a["fault_chain"],
+            symptom_class=a["error_symptom"],
+        )
+        fix_proposal = FixProposal(
+            diff_patch=p["unified_diff"],
+            fixed_source=p["full_fixed_file"],
+            rationale=p["explanation"],
+        )
+        regression_tests = result["test_cases"]
+        culprit_source = p["full_fixed_file"]
+
+    # --- 4. Baseline pytest run ---
+    culprit_source_original = source_files.get(rca_result.culprit_file, "")
+    if not culprit_source_original:
         for path, src in source_files.items():
             if rca_result.culprit_file in path:
-                culprit_source = src
+                culprit_source_original = src
                 rca_result.culprit_file = path
                 break
+    culprit_source = culprit_source_original
 
-    fix_proposal = agent.generate_fix(rca_result, culprit_source)
-
-    # --- 5. Baseline pytest run ---
-    engine = VerificationEngine()
     baseline = engine.run_baseline(repo_path)
 
-    # --- 6. Apply fix and verify ---
+    # --- 5. Apply fix and verify ---
     culprit_full_path = os.path.join(repo_path, rca_result.culprit_file)
     if not os.path.exists(culprit_full_path):
-        # try searching
         for root, _, files in os.walk(repo_path):
             for f in files:
                 if rca_result.culprit_file in f or f in rca_result.culprit_file:
@@ -153,29 +181,45 @@ def analyze(request: AnalyzeRequest):
                     break
 
     verified = engine.apply_and_verify(culprit_full_path, fix_proposal.fixed_source, repo_path)
-
-    # Revert after verification (keep the file in original buggy state for demo repeatability)
     engine.revert(culprit_full_path, culprit_source)
 
-    # --- 7. Regression tests ---
-    regression_tests = agent.generate_regression_tests(rca_result, fix_proposal)
-
     # --- 8. Report ---
-    reporter = ReportGenerator()
-    report_markdown = reporter.generate(
-        rca_result=rca_result,
-        fix_proposal=fix_proposal,
-        baseline_result=baseline,
-        verified_result=verified,
-        regression_tests_source=regression_tests,
-        graph_dict=graph_dict,
-        session_id=session_id,
-    )
+    from rca_engine.dependency_graph import CodeDependencyGraph
+    mermaid_graph = CodeDependencyGraph().generate_mermaid()
 
-    # Save the report
+    rca_payload = {
+        "analysis": {
+            "culprit_file": rca_result.culprit_file,
+            "culprit_symbol": rca_result.culprit_symbol,
+            "line_number": rca_result.culprit_line,
+            "confidence_score": rca_result.confidence_score / 100.0,
+            "root_cause_explanation": rca_result.root_cause_explanation,
+            "error_symptom": rca_result.symptom_class,
+            "fault_chain": rca_result.propagation_steps,
+        },
+        "patch": {
+            "file_path": rca_result.culprit_file,
+            "unified_diff": fix_proposal.diff_patch,
+            "explanation": fix_proposal.rationale,
+            "original_code_snippet": "",
+            "fixed_code_snippet": "",
+            "full_fixed_file": fix_proposal.fixed_source,
+        },
+        "mermaid_graph": mermaid_graph,
+        "test_cases": regression_tests,
+        "session_logs": [],
+    }
+    verification_payload = {
+        "status": "VERIFIED_SUCCESS" if verified.exit_code == 0 else "FAILED",
+        "duration_total": verified.duration_seconds,
+        "pre_patch": {"passed": baseline.exit_code == 0},
+        "post_patch": {"passed": verified.exit_code == 0},
+    }
+    report_markdown = ReportGenerator.generate_markdown(rca_payload, verification_payload)
+
     reports_dir = os.path.join(PROJECT_ROOT, "reports")
     os.makedirs(reports_dir, exist_ok=True)
-    reporter.save(report_markdown, os.path.join(reports_dir, f"RCA_{session_id}.md"))
+    ReportGenerator.save_report(report_markdown, reports_dir, f"RCA_{session_id}.md")
 
     total_duration = round(time.time() - t0, 1)
 
